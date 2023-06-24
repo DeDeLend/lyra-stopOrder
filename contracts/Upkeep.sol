@@ -37,6 +37,19 @@ contract UpkeepStopOrder is
     ) { 
         stopOrder = IStopOrder(_stopOrder);
     }
+
+    ////////////////
+    // ONLY OWNER //
+    ////////////////
+
+    function setStopOrder(address newStopOrder) external onlyOwner {
+        stopOrder = IStopOrder(newStopOrder);
+    }    
+
+    //////////
+    // VIEW //
+    //////////
+
     function checkUpkeep(
         bytes calldata checkData
     )
@@ -77,6 +90,10 @@ contract UpkeepStopOrder is
         performData = abi.encode(indexes);
         return (upkeepNeeded, performData);
     }
+
+    //////////////
+    // EXTERNAL //
+    //////////////    
 
     function performUpkeep(bytes calldata performData) external override {
         (uint256[] memory indexes) = abi.decode(

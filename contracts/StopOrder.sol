@@ -186,7 +186,7 @@ contract StopOrder is Ownable {
     uint256 public withdrawableBalance;
     address public rewardAddress;
     uint256 private activeStopCount;
-    uint256 public maxActiveStopOrders = 400;
+    uint256 public maxActiveStopOrders = 200;
     mapping(uint256 => uint256) public indexTokenToTokenId;
     mapping(uint256 => uint256) public idTokenToIndexToken;
 
@@ -198,6 +198,7 @@ contract StopOrder is Ownable {
     // Events to emit when a stop order is set, deleted, updated, or executed
     event StopOrderSet(uint256 indexed tokenId, uint256 stopOrderPrice, OrderType stopOrderType);
     event StopOrderDeleted(uint256 indexed tokenId);
+    event StopOrderIssue(uint256 indexed tokenId);
     event StopOrderUpdated(uint256 indexed tokenId, uint256 newStopOrderPrice, OrderType newStopOrderType);
     event StopOrderExecuted(uint256 indexed tokenId);
 
@@ -211,6 +212,10 @@ contract StopOrder is Ownable {
         optionMarket = IOptionMarket(_optionMarket);
         optionToken = IOptionToken(_optionToken);
     }
+
+    ////////////////
+    // ONLY OWNER //
+    ////////////////
 
     // Function to set the commission size
     function setCommissionSize(uint256 newCommissionSize) external onlyOwner {
@@ -236,10 +241,145 @@ contract StopOrder is Ownable {
         payable(owner()).transfer(profit);
     }
 
+    //////////
+    // VIEW //
+    //////////
+
     // Function to get the count of active stop orders
     function getActiveStopCount() external view returns (uint256) {
         return activeStopCount;
     }
+
+    function checkExpire(uint256 tokenId) public view returns (bool) {
+        TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
+        return block.timestamp + 30 minutes >= tokenInfo.expirationTime;
+    }
+
+    // Function to check if the conditions for a stop order are met
+    function checkStopOrder(uint256 tokenId) public view returns (bool) {
+        if (checkExpire(tokenId)) {
+            return true;
+        }
+        TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
+        if (tokenInfo.expirationTime == 0) {
+            return false;
+        }
+        uint256 currentPrice = getCurrentPrice();
+        bool stopOrderTriggered = false;
+        if (tokenInfo.stopOrderType == OrderType.GreaterThanOrEqual) {
+            stopOrderTriggered = currentPrice >= tokenInfo.stopOrderPrice;
+        } else if (tokenInfo.stopOrderType == OrderType.LessThanOrEqual) {
+            stopOrderTriggered = currentPrice <= tokenInfo.stopOrderPrice;
+        }
+        return stopOrderTriggered;
+    }    
+
+    // Function to get the current price of a specific token
+    function getCurrentPrice() public view returns (uint256) {
+        (, int256 latestPrice, , , ) = AggregatorV3Interface(priceProvider).latestRoundData();
+        require(latestPrice > 0, "Price should be >= 0");
+        return uint256(latestPrice);
+    }
+
+    function getExpirationTime(uint256 tokenId) internal view returns (uint256) {
+        IOptionToken.OptionPosition memory positionInfo = optionToken.getOptionPosition(tokenId);
+        (, IOptionMarket.OptionBoard memory optBoard) = optionMarket.getStrikeAndBoard(positionInfo.strikeId);
+        return optBoard.expiry;
+    }
+
+    function getOptionType(uint256 tokenId) internal view returns (IOptionMarket.OptionType) {
+        IOptionToken.OptionPosition memory positionInfo = optionToken.getOptionPosition(tokenId);
+        return positionInfo.optionType;
+    }   
+
+    //////////
+    // PURE //
+    ////////// 
+
+    function checkForceCloseErrors(bytes memory err) private pure returns (bool isForce) {
+        if (
+            keccak256(abi.encodeWithSignature('TradingCutoffReached(address,uint256,uint256,uint256)')) == keccak256(getFirstFourBytes(err)) ||
+            keccak256(abi.encodeWithSignature('TradeDeltaOutOfRange(address,int256,int256,int256)')) == keccak256(getFirstFourBytes(err)) 
+        ) return true;
+    }
+
+    function getFirstFourBytes(bytes memory data) public pure returns (bytes memory) {
+        require(data.length >= 4, "Data should be at least 4 bytes long.");
+        
+        bytes memory result = new bytes(4);
+        for (uint i = 0; i < 4; i++) {
+            result[i] = data[i];
+        }
+        
+        return result;
+    }
+
+    /////////////
+    // PRIVATE //
+    /////////////
+
+    function _deleteStopOrder(uint256 tokenId) private {
+        TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
+        require(tokenInfo.expirationTime > 0, "No token set for stop order");
+
+        uint256 commissionToReturn = tokenInfo.commissionPaid;
+        withdrawableBalance -= commissionToReturn;
+        payable(msg.sender).transfer(commissionToReturn);
+
+        // Remove token from the active list
+        _removeTokenFromActiveList(tokenId);
+
+        delete tokenIdToTokenInfo[tokenId];
+        optionToken.transferFrom(address(this), tokenInfo.owner, tokenId);
+    }
+
+    function issueStopOrder(uint256 tokenId) private {
+        _deleteStopOrder(tokenId);
+
+        emit StopOrderIssue(tokenId);
+    }
+
+    function _removeTokenFromActiveList(uint256 tokenId) private {
+        uint256 indexToRemove = idTokenToIndexToken[tokenId];
+        uint256 lastTokenId = indexTokenToTokenId[activeStopCount];
+
+        // Move the last token to the removed token's position
+        indexTokenToTokenId[indexToRemove] = lastTokenId;
+        idTokenToIndexToken[lastTokenId] = indexToRemove;
+
+        // Remove the last token from the active list
+        delete indexTokenToTokenId[activeStopCount];
+        delete idTokenToIndexToken[tokenId];
+        activeStopCount--;
+    }
+
+    function closeOrForceClosePosition(TokenInfo memory tokenInfo) private {
+        IOptionToken.OptionPosition memory positionInfo = optionToken.getOptionPosition(tokenInfo.tokenId);
+        IOptionMarket.TradeInputParameters memory params = IOptionMarket.TradeInputParameters(
+            positionInfo.strikeId,
+            positionInfo.positionId,
+            1,
+            IOptionMarket.OptionType(uint256(positionInfo.optionType)),
+            positionInfo.amount,
+            0,
+            0,
+            type(uint128).max,
+            rewardAddress
+        );
+
+        try optionMarket.closePosition(params) {
+        } catch (bytes memory err) {
+            if (checkForceCloseErrors(err)) {
+                optionMarket.forceClosePosition(params);
+            } else {
+                revert(abi.decode(err, (string)));
+            }
+        }
+    }    
+
+    //////////////
+    // EXTERNAL //
+    //////////////
 
     // Function to set a stop order
     function setStopOrder(
@@ -283,17 +423,7 @@ contract StopOrder is Ownable {
     function deleteStopOrder(uint256 tokenId) external {
         TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
         require(tokenInfo.owner == msg.sender, "Caller must be the owner of the token");
-        require(tokenInfo.expirationTime > 0, "No token set for stop order");
-
-        uint256 commissionToReturn = tokenInfo.commissionPaid;
-        withdrawableBalance -= commissionToReturn;
-        payable(msg.sender).transfer(commissionToReturn);
-
-        // Remove token from the active list
-        _removeTokenFromActiveList(tokenId);
-
-        delete tokenIdToTokenInfo[tokenId];
-        optionToken.transferFrom(address(this), msg.sender, tokenId);
+        _deleteStopOrder(tokenId);
 
         emit StopOrderDeleted(tokenId);
     }
@@ -315,118 +445,25 @@ contract StopOrder is Ownable {
 
     // Function to execute a stop order
     function executeStopOrder(uint256 tokenId) external {
-        TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
-        require(checkStopOrder(tokenId), "Stop order conditions not met");
+        if (checkExpire(tokenId)) {
+            issueStopOrder(tokenId);
+        } else {
+            TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
+            require(checkStopOrder(tokenId), "Stop order conditions not met");
 
-        uint256 commissionToReturn = tokenInfo.commissionPaid;
-        withdrawableBalance -= commissionToReturn;
+            uint256 commissionToReturn = tokenInfo.commissionPaid;
+            withdrawableBalance -= commissionToReturn;
 
-        // Remove token from the active list
-        _removeTokenFromActiveList(tokenId);
+            // Remove token from the active list
+            _removeTokenFromActiveList(tokenId);
 
-        delete tokenIdToTokenInfo[tokenId];
-        IERC20 quoteAsset = IERC20(optionMarket.quoteAsset());
-        uint256 balanceBefore = quoteAsset.balanceOf(address(this));
-        closeOrForceClosePosition(tokenInfo);
-        quoteAsset.transfer(tokenInfo.owner, quoteAsset.balanceOf(address(this)) - balanceBefore);
+            delete tokenIdToTokenInfo[tokenId];
+            IERC20 quoteAsset = IERC20(optionMarket.quoteAsset());
+            uint256 balanceBefore = quoteAsset.balanceOf(address(this));
+            closeOrForceClosePosition(tokenInfo);
+            quoteAsset.transfer(tokenInfo.owner, quoteAsset.balanceOf(address(this)) - balanceBefore);
 
-
-        emit StopOrderExecuted(tokenId);
-    }
-
-    // Function to check if the conditions for a stop order are met
-    function checkStopOrder(uint256 tokenId) public view returns (bool) {
-        TokenInfo memory tokenInfo = tokenIdToTokenInfo[tokenId];
-        if (tokenInfo.expirationTime == 0) {
-            return false;
+            emit StopOrderExecuted(tokenId);
         }
-
-        uint256 timeToExpiration = tokenInfo.expirationTime - block.timestamp;
-        if (timeToExpiration < 30 minutes) {
-            return true;
-        }
-
-        uint256 currentPrice = getCurrentPrice();
-        bool stopOrderTriggered = false;
-        if (tokenInfo.stopOrderType == OrderType.GreaterThanOrEqual) {
-            stopOrderTriggered = currentPrice >= tokenInfo.stopOrderPrice;
-        } else if (tokenInfo.stopOrderType == OrderType.LessThanOrEqual) {
-            stopOrderTriggered = currentPrice <= tokenInfo.stopOrderPrice;
-        }
-        return stopOrderTriggered;
-    }
-    
-    function _removeTokenFromActiveList(uint256 tokenId) private {
-        uint256 indexToRemove = idTokenToIndexToken[tokenId];
-        uint256 lastTokenId = indexTokenToTokenId[activeStopCount];
-
-        // Move the last token to the removed token's position
-        indexTokenToTokenId[indexToRemove] = lastTokenId;
-        idTokenToIndexToken[lastTokenId] = indexToRemove;
-
-        // Remove the last token from the active list
-        delete indexTokenToTokenId[activeStopCount];
-        delete idTokenToIndexToken[tokenId];
-        activeStopCount--;
-    }
-
-    // Function to get the current price of a specific token
-    function getCurrentPrice() public view returns (uint256) {
-        (, int256 latestPrice, , , ) = AggregatorV3Interface(priceProvider).latestRoundData();
-        require(latestPrice > 0, "Price should be >= 0");
-        return uint256(latestPrice);
-    }
-
-    function getExpirationTime(uint256 tokenId) internal view returns (uint256) {
-        IOptionToken.OptionPosition memory positionInfo = optionToken.getOptionPosition(tokenId);
-        (, IOptionMarket.OptionBoard memory optBoard) = optionMarket.getStrikeAndBoard(positionInfo.strikeId);
-        return optBoard.expiry;
-    }
-
-    function closeOrForceClosePosition(TokenInfo memory tokenInfo) internal {
-        IOptionToken.OptionPosition memory positionInfo = optionToken.getOptionPosition(tokenInfo.tokenId);
-        IOptionMarket.TradeInputParameters memory params = IOptionMarket.TradeInputParameters(
-            positionInfo.strikeId,
-            positionInfo.positionId,
-            1,
-            IOptionMarket.OptionType(uint256(positionInfo.optionType)),
-            positionInfo.amount,
-            0,
-            0,
-            type(uint128).max,
-            rewardAddress
-        );
-
-        try optionMarket.closePosition(params) {
-        } catch (bytes memory err) {
-            if (checkForceCloseErrors(err)) {
-                optionMarket.forceClosePosition(params);
-            } else {
-                revert(abi.decode(err, (string)));
-            }
-        }
-    }
-
-    function checkForceCloseErrors(bytes memory err) private pure returns (bool isForce) {
-        if (
-            keccak256(abi.encodeWithSignature('TradingCutoffReached(address,uint256,uint256,uint256)')) == keccak256(getFirstFourBytes(err)) ||
-            keccak256(abi.encodeWithSignature('TradeDeltaOutOfRange(address,int256,int256,int256)')) == keccak256(getFirstFourBytes(err)) 
-        ) return true;
-    }
-
-    function getFirstFourBytes(bytes memory data) public pure returns (bytes memory) {
-        require(data.length >= 4, "Data should be at least 4 bytes long.");
-        
-        bytes memory result = new bytes(4);
-        for (uint i = 0; i < 4; i++) {
-            result[i] = data[i];
-        }
-        
-        return result;
-    }
-
-    function getOptionType(uint256 tokenId) internal view returns (IOptionMarket.OptionType) {
-        IOptionToken.OptionPosition memory positionInfo = optionToken.getOptionPosition(tokenId);
-        return positionInfo.optionType;
     }
 }
